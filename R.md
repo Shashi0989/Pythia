@@ -5,9 +5,9 @@ does, the physics reasoning behind it, why it's written the way it is, and
 how the files connect to each other. It reflects the **current** state of
 the project — a two-generator pipeline (SPS and DPS only; there are no
 standalone `GenerateZ`/`GenerateW` generators and no event-mixing DPS
-model). Repetitive boilerplate (e.g. registering ~70 near-identical ROOT
-branches) is explained once as a pattern rather than re-explained line by
-line, but every distinct piece of logic is covered.
+model). Repetitive boilerplate (e.g. registering ROOT branches) is
+explained once as a pattern rather than re-explained line by line, but
+every distinct piece of logic is covered.
 
 ---
 
@@ -50,6 +50,7 @@ Settings.h  ───────────────────┬──�
                                               reconnection / dipole-
                                               recoil correlation fix)
                                 │                     │
+                    (raw per-particle kinematics only)
                                 ▼                     ▼
                         root/SPS_<N>.root      root/DPS_<N>.root
                                 │                     │
@@ -71,11 +72,28 @@ generators, running them, and invoking the three Python scripts above.
 `settings_editor.py` changes `Settings.h` (and therefore N, MPI, beam
 energy, mass window) in between runs.
 
-Both generators write a tree named **`Events`** with an **identical branch
-schema** — every branch name means the same physical quantity in both
-files. This is what lets every Python script load an `SPS_*.root` and a
-`DPS_*.root` and plot them directly against each other with no
-file-type-specific logic anywhere.
+Both generators write a tree named **`Events`** with an **identical
+branch schema** — every branch name means the same physical quantity in
+both files. Critically, **both generators now write only the raw,
+per-particle kinematics PYTHIA/ROOT hand back directly** (pt, eta, phi,
+mass/rapidity, and the raw px, py, pz, E four-vector, for every relevant
+particle), plus the handful of event-record-only quantities that
+genuinely cannot be recomputed outside PYTHIA (`nJets30`, `W_charge`,
+`weight`). Every *derived*, cross-particle observable — Δη/Δφ/Δy between
+the two bosons, the WZ invariant mass and system pT, the scalar pT sum,
+the relative pT imbalance, and every lepton-level Δφ — is **no longer
+computed or stored by the generators at all**. It is computed entirely in
+the Python analysis layer instead, once per file load, inside each
+script's own `load()` function (`Compare.py` / `Convergence.py` /
+`Analyze.py`), via vectorized NumPy operating on the raw branches. This
+is a deliberate design split: the C++ generators are pure data producers
+("generate events, save exactly what PYTHIA measured"), and every
+downstream calculation lives in the analysis scripts that already own
+that responsibility. This is what lets every Python script load an
+`SPS_*.root` and a `DPS_*.root` and plot them directly against each other
+with no file-type-specific logic anywhere — and it also means the three
+Python scripts, not the two generators, are now the single source of
+truth for how every derived observable is defined.
 
 ---
 
@@ -243,10 +261,16 @@ physical separation (e.g. φ1 = −179°, φ2 = 179° are only 2° apart on the
 circle, but the naive difference gives 358°). This function folds the raw
 difference into `[0, π]`: if it exceeds π, the true separation is `2π`
 minus that difference (the short way around the circle). This is the
-standard definition used throughout collider physics, and **every**
-`dPhi(...)` observable in every generator and analysis script in this
-project calls exactly this one function, so the folding convention is
-identical everywhere.
+standard definition used throughout collider physics.
+
+Note: as of the current generators, this `dPhi()` helper is declared in
+`Settings.h` but is **not actually called from the C++ generators
+anymore** — neither `GenerateSPS.cc` nor `GenerateDPS.cc` computes any
+Δφ observable itself. Its folding convention lives on only as the
+reference definition that the Python analysis layer's own `_dphi_np()`-
+style helpers reimplement (see §4) — every `dPhi_*` observable in every
+plot and every test in the project still ends up folded to `[0, π]`, just
+computed in NumPy on the Python side instead of in C++ per-event.
 
 ---
 
@@ -313,15 +337,18 @@ setting string; see §3). Checking the return value and bailing out with a
 nonzero exit code is what lets the Makefile/shell scripts detect a failed
 run instead of silently producing a garbage or empty ROOT file.
 
-### ROOT tree and branch declarations
+### ROOT tree and branch declarations — raw kinematics only
 
 ```cpp
 TFile* fOut = TFile::Open(outPath.c_str(), "RECREATE");
-TTree* tree = new TTree("Events", "SPS WZ production");
+TTree* tree = new TTree("Events", "SPS WZ production (raw kinematics)");
 ```
 `"RECREATE"` overwrites any existing file at `outPath`. The tree is named
 `"Events"` — exactly the name every Python reader
-(`uproot.open(path)["Events"]`) expects.
+(`uproot.open(path)["Events"]`) expects. The tree's title has been
+updated to say "raw kinematics" — a direct reflection of the current
+design: **this file stores nothing but what PYTHIA/ROOT hand back for
+each individual particle.**
 
 Each declared `double`/`int` variable (`W_pt`, `W_eta`, …) is a **row
 buffer**: ROOT's `TTree::Branch` API binds a branch name to the memory
@@ -331,42 +358,38 @@ column. This is why the fill loop always writes to the same named
 variable and then calls `Fill()` — the address never changes, only the
 value does.
 
-The branches fall into clear groups:
+The branches now fall into exactly these groups, and **no others**:
 
-- **W boson 4-vector + derived kinematics**: `W_pt, W_eta, W_phi,
-  W_mass, W_rapidity` (physically meaningful quantities) plus the raw
-  Cartesian `W_px, W_py, W_pz, W_E` (needed for any downstream calculation
-  that must combine two 4-vectors, like an invariant mass — you can't add
-  two pT scalars and get a physically meaningful "combined pT", you must
-  add the vector components). `W_charge` records ±1.
-- **Z boson**: identical structure, `Z_*`.
-- **WZ-system observables**: `dEta_WZ, dPhi_WZ, dY_WZ, M_WZ, pT_WZ, sT`
-  — quantities describing the relationship between the two bosons, not
-  either boson individually. Computed once per event in the loop below —
-  there's no PYTHIA setting that directly gives "the angle between two
-  already-decayed bosons."
+- **W boson raw kinematics**: `W_pt, W_eta, W_phi, W_mass, W_rapidity`
+  plus the raw Cartesian `W_px, W_py, W_pz, W_E` (needed for any
+  downstream calculation that must combine two 4-vectors, like an
+  invariant mass — you can't add two pT scalars and get a physically
+  meaningful "combined pT", you must add the vector components).
+  `W_charge` records ±1 — an event-record-only quantity (a PDG-id-sign
+  lookup) that genuinely can't be recomputed from the stored kinematics.
+- **Z boson raw kinematics**: identical structure, `Z_*`.
 - **W decay products**: `lep_*` (the W's charged lepton, μ⁻ or μ⁺
   depending on `W_charge`) and `nu_*` (its neutrino) — the actual
   final-state particles a real detector would see.
 - **Z decay products**: `lep1_*` (always the μ⁻) and `lep2_*` (always the
   μ⁺) — the Z's own two decay leptons, labelled unambiguously by charge
   sign rather than "whichever muon PYTHIA listed first," so that e.g.
-  `dPhi_Z_lep1` means the same physical angle in every event.
-- **Every required pairwise Δφ observable**: `dPhi_WZ` (W–Z, declared
-  above), `dPhi_Z_lep` / `dPhi_Z_nu` (Z vs. the *W's own* lepton /
-  neutrino), and the full remaining set —
-  `dPhi_lep1_lep2` (the two Z leptons), `dPhi_lep_nu` (the W's lepton vs.
-  its own neutrino), `dPhi_W_lep1`, `dPhi_W_lep2` (W vs. each Z lepton),
-  `dPhi_Z_lep1`, `dPhi_Z_lep2` (Z vs. each of its own leptons). Since
-  Δφ(W,ℓ) and Δφ(ℓ,W) are the same physical angle, only one branch is
-  stored per pair.
-- **`pT_imbalance`**: the vector-based relative pT-imbalance observable
-  (see the dedicated discussion below).
+  a downstream Δφ(Z, lep1) means the same physical angle in every event.
 - **Event-level**: `weight` (PYTHIA's per-event weight — effectively
   always 1.0 for this unweighted LO sample, but read from PYTHIA rather
   than hard-coded so the code stays correct if a weighted process is ever
   swapped in) and `nJets30` (a rough jet-multiplicity proxy, explained
   where it's computed below).
+
+**What is *not* here anymore:** there are no `dEta_WZ`, `dPhi_WZ`,
+`dY_WZ`, `M_WZ`, `pT_WZ`, `sT`, `pT_imbalance`, or any `dPhi_*`
+lepton-pair branches. Every one of those cross-particle, derived
+quantities used to be computed in this file's event loop and written as
+its own branch; all of that logic has been deleted from the generator
+entirely and now lives in each Python analysis script's `load()`
+function instead (see §4), computed from the raw branches listed above.
+The file's own header comment states this design choice explicitly:
+*"generators only GENERATE, they do not ANALYSE."*
 
 ```cpp
 tree->Branch("W_pt", &W_pt);
@@ -374,9 +397,9 @@ tree->Branch("W_pt", &W_pt);
 ```
 Each `tree->Branch("name", &variable)` call registers one column: "the
 column called `name` is filled from whatever is currently in `variable`."
-This block of ~70 calls is mechanical but essential — it *is* the ROOT
-file's schema, and every downstream Python script's `d["W_pt"]`-style
-access depends on these exact string names matching.
+This block of calls is mechanical but essential — it *is* the ROOT file's
+schema, and every downstream Python script's `d["W_pt"]`-style access
+depends on these exact string names matching.
 
 ### The event loop
 
@@ -458,8 +481,8 @@ are used to distinguish them: `lep1` is always specifically the μ⁻
 id 13, μ⁺ has −13 — a common point of confusion, since particle/
 antiparticle sign convention for leptons doesn't track electric charge
 sign directly), `lep2` is always the μ⁺. This gives a consistent,
-unambiguous labelling so that `dPhi_Z_lep1` means the same physical angle
-in every single event.
+unambiguous labelling so that any downstream `dPhi_Z_lep1`-type
+observable means the same physical angle in every single event.
 
 ```cpp
 nJets30 = 0;
@@ -478,7 +501,9 @@ arbitrary-but-standard-ish "hard enough to plausibly become a
 reconstructed jet" threshold. This is explicitly *not* a real jet
 algorithm (no clustering) — a fast approximation, good enough to
 distinguish "basically no extra radiation" from "clearly some hard extra
-activity" event by event.
+activity" event by event. Like `W_charge`, this stays in the generator
+because it requires walking the full PYTHIA particle list — it is not a
+"derived observable" recomputable from any single stored branch.
 
 ```cpp
 const Particle& pW = pythia.event[iW];
@@ -491,91 +516,8 @@ all these kinematic quantities as simple accessor methods —
 `pT() = √(px²+py²)`, `eta() = -ln(tan(θ/2))` (pseudorapidity),
 `y() = ½ln((E+pz)/(E−pz))` (true rapidity), etc. — all computed internally
 by PYTHIA from the particle's stored 4-momentum. The same pattern fills
-the `Z_*` block from `pZ`.
-
-```cpp
-dEta_WZ = fabs(W_eta - Z_eta);
-dPhi_WZ = dPhi(W_phi, Z_phi);
-dY_WZ   = fabs(W_rapidity - Z_rapidity);
-```
-The three "gap" observables between the two bosons: pseudorapidity gap,
-folded azimuthal gap (via the shared `dPhi()` helper), rapidity gap.
-These are always the **absolute value** — never the signed difference
-(the Python analysis layer separately derives signed versions from the
-raw `W_eta`/`Z_eta` branches when a signed, negative-axis plot is wanted;
-see §5).
-
-```cpp
-Vec4 pWZ = pW.p() + pZ.p();
-M_WZ  = pWZ.mCalc();
-pT_WZ = pWZ.pT();
-sT    = W_pt + Z_pt;
-```
-`Vec4` is PYTHIA's four-vector class; `+` between two `Vec4`s is genuine
-4-vector addition. `pWZ.mCalc()` computes the invariant mass of the
-summed 4-vector, `√(E²−p²)` — not the same thing as `W_mass + Z_mass` (in
-general strictly greater, equal only if the two bosons are exactly
-collinear). `pWZ.pT()` is "how much net transverse momentum does the WZ
-system as a whole carry" (nonzero only from initial-state-radiation
-recoil in SPS, since two back-to-back objects sum to zero net pT). `sT`
-by contrast is a scalar sum of individual pT magnitudes, indifferent to
-relative direction.
-
-```cpp
-const Particle& pLep = pythia.event[iLep];
-lep_pt = pLep.pT(); ...
-const Particle& pNu = pythia.event[iNu];
-nu_pt = pNu.pT(); ...
-dPhi_Z_lep = dPhi(Z_phi, lep_phi);
-dPhi_Z_nu  = dPhi(Z_phi, nu_phi);
-```
-Same accessor pattern applied to the W's two decay daughters, followed by
-the two Δφ observables computed directly from the just-filled `phi`
-values.
-
-```cpp
-const Particle& pLep1 = pythia.event[iLep1]; ...
-const Particle& pLep2 = pythia.event[iLep2]; ...
-
-dPhi_lep1_lep2 = dPhi(lep1_phi, lep2_phi);
-dPhi_lep_nu    = dPhi(lep_phi, nu_phi);
-dPhi_W_lep1    = dPhi(W_phi, lep1_phi);
-dPhi_W_lep2    = dPhi(W_phi, lep2_phi);
-dPhi_Z_lep1    = dPhi(Z_phi, lep1_phi);
-dPhi_Z_lep2    = dPhi(Z_phi, lep2_phi);
-```
-Every remaining pairwise azimuthal separation the project's observable
-list requires, computed the same way once each event's daughters are
-known: the two Z leptons against each other, the W's own lepton against
-its own neutrino, the W against each Z lepton, and the Z against each of
-its own leptons.
-
-```cpp
-{
-    double sumPx = W_px + Z_px;
-    double sumPy = W_py + Z_py;
-    double denom = W_pt + Z_pt;
-    pT_imbalance = (denom > 0.)
-        ? sqrt(sumPx*sumPx + sumPy*sumPy) / denom : 0.;
-}
-```
-The **vector** definition of relative pT imbalance:
-
-```
-A_rel = | p⃗T(W) + p⃗T(Z) | / ( |p⃗T(W)| + |p⃗T(Z)| )
-```
-
-built from the actual `(px, py)` components — not just the scalar `pT`
-magnitudes — so it measures true vector cancellation. It is small only
-when the two bosons are close to back-to-back *and* comparable in
-magnitude (the SPS expectation), and is O(1) whenever the vector sum
-fails to cancel — generic for independent DPS production but rare for
-momentum-conserving SPS production. The ratio's numerator (a vector
-magnitude) over its denominator (a scalar sum of magnitudes) guarantees
-`A_rel ∈ [0, 1]` by construction. The enclosing `{ }` is just a local
-scope so `sumPx`, `sumPy`, `denom` don't pollute the surrounding function.
-The ternary guards the essentially-impossible case of both bosons having
-exactly zero pT.
+the `Z_*` block from `pZ`, and then the `lep_*`/`nu_*`/`lep1_*`/`lep2_*`
+blocks from the corresponding daughter particles.
 
 ```cpp
 weight = pythia.info.weight();
@@ -584,7 +526,13 @@ tree->Fill();
 ```
 `pythia.info.weight()` retrieves this event's Monte Carlo weight.
 `tree->Fill()` is the moment every currently-set branch variable is
-copied into a new row of the tree.
+copied into a new row of the tree. Immediately before this, the source
+carries an explicit comment recording the design decision: every
+cross-particle derived quantity that used to be computed here (`dEta_WZ`,
+`dPhi_WZ`, `dY_WZ`, `M_WZ`, `pT_WZ`, `sT`, every lepton-level Δφ,
+`pT_imbalance`, …) is now computed in the Python analysis layer's
+`load()` functions instead, directly from the raw branches above — this
+file only ever writes what PYTHIA measured.
 
 ### Wrap-up
 
@@ -606,11 +554,14 @@ a large `nNoLepNu` count, is a red flag worth investigating.
 ## 3. `GenerateDPS.cc` — the DPS generator
 
 Structurally this file is extremely similar to `GenerateSPS.cc` — same
-includes, same branch-declaration pattern (identical schema, including
-all the same `lep1_*`/`lep2_*`/Δφ branches described in §2), same event
-loop skeleton, same lepton-finding logic, same summary printout. This
-section focuses on everything that's genuinely *different* — which is
-where the actual "DPS vs SPS" physics content lives.
+includes, same raw-kinematics-only branch-declaration pattern (identical
+schema, including the same `lep1_*`/`lep2_*` branches described in §2),
+same event loop skeleton, same lepton-finding logic, same jet-counting,
+same summary printout, and the **same absence** of any derived,
+cross-particle branch (no `dEta_WZ`/`dPhi_WZ`/`dY_WZ`/`M_WZ`/`pT_WZ`/
+`sT`/`pT_imbalance`/`dPhi_*` — all of it lives in Python now, see §4).
+This section focuses on everything that's genuinely *different* — which
+is where the actual "DPS vs SPS" physics content lives.
 
 ### Why DPS needs a fundamentally different PYTHIA configuration
 
@@ -727,16 +678,20 @@ colour reconnection using PYTHIA's default reconnection range, which is
 sufficient for the soft correlation mechanism described; no directly
 equivalent replacement setting is needed.
 
-### The rest of the file
+### The rest of the file — raw kinematics only, same as §2
 
 Branch declarations, the event loop, lepton-finding (for both the W's
-`lep`/`nu` and the Z's `lep1`/`lep2`), jet-counting, every Δφ computation,
-and the `pT_imbalance` calculation are structurally identical to
-`GenerateSPS.cc` — the same reasoning applies line-for-line (see §2). The
-two generators produce ROOT files with an **identical branch schema**,
-which is exactly what makes it possible for `Compare.py` (and every other
-analysis script) to load an `SPS_*.root` and a `DPS_*.root` and plot them
-on the same axes.
+`lep`/`nu` and the Z's `lep1`/`lep2`), and jet-counting are structurally
+identical to `GenerateSPS.cc` — the same reasoning applies line-for-line
+(see §2). As in the SPS generator, the fill block ends with an explicit
+comment recording that every cross-particle derived quantity that used to
+live here (`dEta_WZ`, `dPhi_WZ`, `dY_WZ`, `M_WZ`, `pT_WZ`, `sT`, every
+lepton-level Δφ, `pT_imbalance`, …) has been moved out to the Python
+analysis layer's `load()` functions, computed from the raw branches. The
+two generators produce ROOT files with an **identical, raw-kinematics-only
+branch schema**, which is exactly what makes it possible for `Compare.py`
+(and every other analysis script) to load an `SPS_*.root` and a
+`DPS_*.root` and plot them on the same axes.
 
 ---
 
@@ -779,16 +734,19 @@ this one list rather than any observable-specific `if`/`elif` chain — to
 add or remove an observable from every plot type at once, you edit
 exactly one line here. (`Analyze.py` and `Convergence.py` each keep their
 own independent copy of this same catalogue, per the project's design
-choice of not sharing a common module — see §9.)
+choice of not sharing a common module — see §9.) Note that **every
+non-raw key in this table** — `dEta_signed`, `dPhi_WZ`, `dY_signed`,
+`M_WZ`, `sT`, `pT_WZ`, `pT_imbalance`, and every `dPhi_*` lepton-pair
+entry — is now a *derived* key computed inside `load()` (below), not a
+ROOT branch; only `Z_pt` and `W_pt` are read straight off the tree.
 
-`dEta_signed`/`dY_signed` (not `dEta_WZ`/`dY_WZ` directly) are **not**
-ROOT branches; they're derived in Python (see `load()` below) from the
-raw `W_eta`/`Z_eta` branches, specifically so the plotted quantity can be
-signed (range −5 to 5) rather than the generator's stored `|Δη|` (always
-≥ 0, which loses the "which boson is more forward" information). The
-range is clipped to ±5, matching the finite pseudorapidity acceptance of
-a real detector rather than plotting generator-level tails no real
-experiment could see.
+`dEta_signed`/`dY_signed` are **not** ROOT branches; they're derived in
+Python (see `load()` below) from the raw `W_eta`/`Z_eta` branches,
+specifically so the plotted quantity can be signed (range −5 to 5) rather
+than an always-non-negative `|Δη|`/`|Δy|`, which would lose the "which
+boson is more forward" information. The range is clipped to ±5, matching
+the finite pseudorapidity acceptance of a real detector rather than
+plotting generator-level tails no real experiment could see.
 
 `pT_imbalance`'s range `(0, 1)` reflects the vector definition described
 in §2/§3: a ratio of a vector magnitude to a scalar sum, mathematically
@@ -796,13 +754,14 @@ guaranteed to lie in `[0, 1]`.
 
 The eight `dPhi_*` entries after `pT_imbalance` are every physically
 distinct pairwise azimuthal separation the project requires: `dPhi_Z_lep`
-and `dPhi_Z_nu` (Z vs. the W's own lepton/neutrino — used by earlier
-analyses and kept), and the newer `dPhi_lep1_lep2`, `dPhi_lep_nu`,
-`dPhi_W_lep1`, `dPhi_W_lep2`, `dPhi_Z_lep1`, `dPhi_Z_lep2` completing the
-full set among `{W, Z, lepton1, lepton2, neutrino}`. All read directly
-from the correspondingly-named ROOT branches the generators fill — no
-extra derivation needed in Python, since the folding to `[0, π]` already
-happened in C++ via the shared `dPhi()` helper.
+and `dPhi_Z_nu` (Z vs. the W's own lepton/neutrino), and
+`dPhi_lep1_lep2`, `dPhi_lep_nu`, `dPhi_W_lep1`, `dPhi_W_lep2`,
+`dPhi_Z_lep1`, `dPhi_Z_lep2` completing the full set among
+`{W, Z, lepton1, lepton2, neutrino}`. Since the generators no longer store
+any Δφ branch at all, every one of these is now computed in `load()` from
+the raw `*_phi` branches, via the same `[0, π]`-folding convention as the
+C++ `dPhi()` helper in `Settings.h` (reimplemented as a NumPy-vectorized
+helper on the Python side — see below).
 
 ### AUTO_MODE / safe_input
 
@@ -834,15 +793,56 @@ silently skips a menu a real user could have answered.
 
 ```python
 def load(path, tree="Events"):
+    """Load the RAW per-particle branches from a ROOT TTree via uproot,
+    then compute every cross-particle derived observable here in Python.
+
+    The generators (GenerateSPS.cc / GenerateDPS.cc) only ever write raw
+    kinematics -- pt, eta, phi, mass/rapidity, and the raw px,py,pz,E
+    four-vector -- for each relevant particle (W, Z, the W's lepton and
+    neutrino, and the Z's two leptons), plus a couple of event-record-only
+    quantities (nJets30, W_charge, weight) that can't be recomputed
+    outside PYTHIA. Every *derived*, multi-particle observable -- angular
+    gaps, the WZ invariant mass and system pT, the scalar pT sum, every
+    lepton-level Delta-phi, and the relative pT imbalance -- is computed
+    right here instead, once per file load, via vectorized NumPy across
+    the whole sample. This keeps all analysis logic in the analysis
+    scripts, not the generators."""
+    print(f"  Loading {path} ...")
     d = uproot.open(path)[tree].arrays(library="np")
-    if "pT_imbalance" not in d:
-        sumPx = d["W_px"] + d["Z_px"]
-        sumPy = d["W_py"] + d["Z_py"]
-        denom = d["W_pt"] + d["Z_pt"]
-        d["pT_imbalance"] = np.where(denom > 0,
-                                     np.hypot(sumPx, sumPy) / denom, 0.0)
+    print(f"    {len(d['W_pt']):,} events")
+
+    # ---- WZ-system observables ----
+    d["dEta_WZ"] = np.abs(d["W_eta"] - d["Z_eta"])
+    d["dPhi_WZ"] = _dphi_np(d["W_phi"], d["Z_phi"])
+    d["dY_WZ"]   = np.abs(d["W_rapidity"] - d["Z_rapidity"])
+
+    sumPx_WZ = d["W_px"] + d["Z_px"]
+    sumPy_WZ = d["W_py"] + d["Z_py"]
+    sumPz_WZ = d["W_pz"] + d["Z_pz"]
+    sumE_WZ  = d["W_E"]  + d["Z_E"]
+    d["M_WZ"]  = np.sqrt(np.clip(sumE_WZ**2 - sumPx_WZ**2 - sumPy_WZ**2 - sumPz_WZ**2, 0, None))
+    d["pT_WZ"] = np.hypot(sumPx_WZ, sumPy_WZ)
+    d["sT"]    = d["W_pt"] + d["Z_pt"]
+
+    # ---- pT imbalance: vector definition ----
+    denom = d["W_pt"] + d["Z_pt"]
+    d["pT_imbalance"] = np.where(denom > 0,
+                                 np.hypot(sumPx_WZ, sumPy_WZ) / denom, 0.0)
+
+    # ---- Lepton-level Delta-phi observables ----
+    d["dPhi_Z_lep"]     = _dphi_np(d["Z_phi"], d["lep_phi"])
+    d["dPhi_Z_nu"]      = _dphi_np(d["Z_phi"], d["nu_phi"])
+    d["dPhi_lep1_lep2"] = _dphi_np(d["lep1_phi"], d["lep2_phi"])
+    d["dPhi_lep_nu"]    = _dphi_np(d["lep_phi"], d["nu_phi"])
+    d["dPhi_W_lep1"]    = _dphi_np(d["W_phi"], d["lep1_phi"])
+    d["dPhi_W_lep2"]    = _dphi_np(d["W_phi"], d["lep2_phi"])
+    d["dPhi_Z_lep1"]    = _dphi_np(d["Z_phi"], d["lep1_phi"])
+    d["dPhi_Z_lep2"]    = _dphi_np(d["Z_phi"], d["lep2_phi"])
+
+    # ---- Derived: SIGNED Δη and Δy (not folded to |...|) ----
     d["dEta_signed"] = d["W_eta"]      - d["Z_eta"]
     d["dY_signed"]   = d["W_rapidity"] - d["Z_rapidity"]
+
     return d
 ```
 `uproot` is a pure-Python library for reading ROOT files without needing a
@@ -851,11 +851,18 @@ returns a dict mapping every branch name to a NumPy array of that
 branch's values across all events — so computing a derived quantity is a
 single vectorized NumPy operation across the entire dataset (not a
 Python-level per-event loop, which matters for performance with
-hundreds-of-thousands-of-rows arrays). `pT_imbalance` is normally already
-a stored branch (computed in C++, see §2/§3); the Python fallback recomputes
-it from `px`/`py` only for older ROOT files that predate that branch, using
-the identical vector formula. The signed Δη/Δy derivation happens here
-because the generator only stores the folded `|...|` version.
+hundreds-of-thousands-of-rows arrays). `load()` now does **all** of the
+derivation work that the C++ generators used to do: `_dphi_np()` is the
+NumPy-vectorized counterpart of `Settings.h`'s C++ `dPhi()` helper (fold
+the raw angular difference to `[0, π]`), and every WZ-system quantity
+(`dEta_WZ`, `dPhi_WZ`, `dY_WZ`, `M_WZ`, `pT_WZ`, `sT`), the vector
+`pT_imbalance`, all eight lepton-level `dPhi_*` observables, and the
+signed `dEta_signed`/`dY_signed` pair are computed here from the raw
+branches, exactly once per file load, rather than being read pre-computed
+off the tree. `M_WZ`'s `np.clip(..., 0, None)` guards against a tiny
+negative value under the square root from floating-point round-off right
+at the (near-)massless-system edge case — the 4-vector-sum analogue of
+`Vec4::mCalc()`'s own internal safety in PYTHIA.
 
 ### Binning strategy: `_adaptive_edges` / `_log_edges` / `_choose_edges`
 
@@ -879,7 +886,8 @@ peak well) and few wide bins where events are sparse (without those bins
 being individually noisy). `np.unique` guards against duplicate edges
 (possible with many identical values, e.g. from a hard phase-space cut);
 the two size checks fall back to plain equal-width bins whenever there
-isn't enough data for quantile binning to be meaningful.
+isn't enough data for quantile binning to be meaningful. This is used for
+the pT/mass-type observables' histograms (see below).
 
 ```python
 def _log_edges(lo, hi, nbins, floor=1.0):
@@ -900,16 +908,36 @@ fact that log-spacing is undefined starting exactly at 0 — everything
 below the smallest meaningful geometric step lands in one small `[0,
 floor)` bin, and geometric spacing takes over from there.
 
+### Plotting strategy: KDE for angular observables, histograms for pT/mass
+
+The current script's own header now documents an explicit split in how
+different observable families are drawn:
+
+- **Angular observables (`dEta`, `dPhi`, `dY`) and any Δ*R*-type
+  quantity**: drawn with a **Gaussian KDE** (`scipy.stats.gaussian_kde`),
+  since these distributions are smooth and bounded, and a KDE gives a
+  cleaner visual curve than a histogram for that shape.
+- **pT observables (`Z_pt`, `W_pt`, `sT`, `pT_WZ`) and `M_WZ`**: drawn
+  with **normalized histograms and Poisson error bars** instead, using
+  the `_adaptive_edges`/`_log_edges` machinery above. A KDE is
+  deliberately *not* used here because it fails on the DPS sample's
+  heavy-tailed pT distributions — rare hard `SecondHard:WAndJet` events
+  inflate the sample variance, which causes the KDE's Silverman
+  bandwidth rule to pick an absurdly wide or narrow kernel. Fixed/adaptive-
+  bin histograms are the numerically robust tool for these observables,
+  so the script keeps them for that family rather than trying to force a
+  single drawing method onto every observable.
+
+### `_choose_edges`, `_norm_hist`, and the drawing functions
+
 ```python
 def _choose_edges(pooled_vals, lo, hi, nbins, logy):
     return _log_edges(lo, hi, nbins) if logy else _adaptive_edges(pooled_vals, lo, hi, nbins)
 ```
-The dispatcher: each observable's own `use_log_y` flag (from the
-catalogue) automatically picks the right binning strategy — falling
-pT/mass spectra get log bins, bounded/peaked angular and ratio
-observables get quantile bins.
-
-### `_norm_hist`
+The dispatcher for the histogram family above: each observable's own
+`use_log_y` flag (from the catalogue) automatically picks the right
+binning strategy — falling pT/mass spectra get log bins, bounded/peaked
+histogram-drawn observables get quantile bins.
 
 ```python
 def _norm_hist(vals, edges):
@@ -928,8 +956,6 @@ is the standard Poisson uncertainty on a raw count, propagated through
 the same normalization. The `1e-12` is a numerical-safety epsilon
 against division by exactly zero.
 
-### Plot styling and drawing functions
-
 `plt.rcParams.update({...})` sets a single, consistent visual style
 (serif font, tick direction/size, DPI, `pdf.fonttype: 42` so PDF text
 stays selectable/searchable rather than rasterized) applied automatically
@@ -941,13 +967,13 @@ unchanged from the project's original design and must stay that way.
 `plot_panel(...)`, `make_process_single(...)`, `make_summary(...)`,
 `make_eta_heatmap(...)` are the figure-drawing functions: given
 already-loaded data and an observable's catalogue entry, they draw the
-correct axis (histogram + error bars via `ax.stairs`/`ax.errorbar`, or
-the (η_W, η_Z) 2D joint-density heatmap via `ax.hist2d`), compute and
-annotate the KS statistic (`scipy.stats.ks_2samp` — tests whether the SPS
-and DPS samples for this observable could plausibly be drawn from the
-same underlying distribution; a low p-value means "no, they're
-statistically distinguishable"), and save to the correct path under
-`plots/`.
+correct axis (KDE curve via `_kde_curve`/`gaussian_kde`, or normalized
+histogram + error bars via `ax.stairs`/`ax.errorbar`, or the (η_W, η_Z)
+2D joint-density heatmap via `ax.hist2d`), compute and annotate the KS
+statistic (`scipy.stats.ks_2samp` — tests whether the SPS and DPS samples
+for this observable could plausibly be drawn from the same underlying
+distribution; a low p-value means "no, they're statistically
+distinguishable"), and save to the correct path under `plots/`.
 
 `main()` ties it together: discover available (SPS, DPS) file pairs for
 matching N values, ask (or auto-pick, per `AUTO_MODE`) which pair(s),
@@ -969,11 +995,13 @@ statistics, or is what I'm seeing still just noise from too few events?"
 ### Shared machinery with `Compare.py`
 
 `ALL_OBSERVABLES` (extended with the same eight `dPhi_*` entries
-described in §4), `_adaptive_edges`, `_log_edges`, `_choose_edges`,
-histogram helpers, and `safe_input` follow the same reasoning as the
-identically-named pieces in `Compare.py` — deliberately kept consistent
-so a reader who understands one script already understands the
-corresponding piece of the other. The differences worth calling out:
+described in §4), the shared `load()`-style derivation of every
+cross-particle observable from raw branches, `_adaptive_edges`,
+`_log_edges`, `_choose_edges`, histogram helpers, and `safe_input` follow
+the same reasoning as the identically-named pieces in `Compare.py` —
+deliberately kept consistent so a reader who understands one script
+already understands the corresponding piece of the other. The differences
+worth calling out:
 
 ```python
 def make_palette(n_items): ...
@@ -1020,11 +1048,11 @@ observables.
 
 `draw_panel(...)`, `make_individual(...)`, `make_summary(...)`,
 `print_stats_table(...)` are the drawing functions, following the same
-histogram/error-bar logic as `Compare.py`'s `plot_panel`, but looping
-over multiple `(N, dataset)` pairs instead of a fixed SPS/DPS pair.
-`ask_mode_menu(...)` and `ask_n_selection(...)` are the interactive menus
-specific to this script: which process (SPS, DPS, or both) and which
-subset of available N values to include in the overlay.
+histogram/error-bar/KDE logic as `Compare.py`'s drawing functions, but
+looping over multiple `(N, dataset)` pairs instead of a fixed SPS/DPS
+pair. `ask_mode_menu(...)` and `ask_n_selection(...)` are the interactive
+menus specific to this script: which process (SPS, DPS, or both) and
+which subset of available N values to include in the overlay.
 
 ---
 
@@ -1044,17 +1072,19 @@ artifact."
 (kept independently per-file rather than imported from a shared module,
 per the project's stated goal of not restructuring the existing
 architecture), extended with the same eight lepton-level `dPhi_*` entries
-described in §4. `CORR_PAIRS` is a separate list of raw kinematic branch
-pairs (e.g. `(W_eta, Z_eta)`) used specifically by the 2D
+described in §4 — and, like the other scripts, every non-raw entry in it
+is derived in Python from raw branches rather than read pre-computed off
+the tree. `CORR_PAIRS` is a separate list of raw kinematic branch pairs
+(e.g. `(W_eta, Z_eta)`) used specifically by the 2D
 correlation/joint-density analyses — a distinct list because those
 functions inherently work on two variables at once, not one.
 
 ### `_paired_ns` / `discover` / `load`
 
-Same file-discovery and branch-loading logic as `Compare.py`, adapted to
-this script's needs (e.g. `_paired_ns` specifically finds every N for
-which both an SPS and a DPS file exist, since every analysis here needs a
-matched pair).
+Same file-discovery and raw-branch-loading-plus-derivation logic as
+`Compare.py`, adapted to this script's needs (e.g. `_paired_ns`
+specifically finds every N for which both an SPS and a DPS file exist,
+since every analysis here needs a matched pair).
 
 ### The `analysis_*` functions — one per statistical test
 
@@ -1076,7 +1106,9 @@ its numbers" unit:
   `CORR_PAIRS`) — the direct visual counterpart to the correlation
   matrix's single numbers.
 - **`analysis_deltaR`** — `ΔR(W,Z) = √(Δη² + Δφ²)`, the standard collider
-  angular-separation observable combining both angles into one number.
+  angular-separation observable combining both angles into one number,
+  built from the Python-derived `dEta_WZ`/`dPhi_WZ` (no longer ROOT
+  branches — see §4).
 - **`analysis_shape`** — skewness, kurtosis, and other distribution-shape
   statistics for each observable, a more quantitative alternative to
   eyeballing "does this histogram look different."
@@ -1089,7 +1121,7 @@ its numbers" unit:
   `(N_forward − N_backward) / (N_forward + N_backward)`, computed on
   *signed* rapidity-type observables (this is exactly where the signed
   `dY_signed`/`dEta_signed` derivation matters — an asymmetry computed on
-  an always-non-negative branch would be meaningless by construction,
+  an always-non-negative quantity would be meaningless by construction,
   since "backward" would never register any events).
 - **`analysis_chi2`** — bin-by-bin χ² goodness-of-fit between the SPS and
   DPS histograms, on fixed-width bins deliberately (not the adaptive
@@ -1100,11 +1132,12 @@ its numbers" unit:
 - **`analysis_uniformity`** — the χ²-vs-flat test built to give a
   rigorous, numeric answer to "is DPS's Δφ distribution actually flat, or
   does it have real (if subtle) structure," using fixed bins and the
-  folded `|Δφ|` branches. Its range dictionary now also covers every one
-  of the new lepton-level Δφ observables (`dPhi_lep1_lep2`, `dPhi_lep_nu`,
+  folded `|Δφ|` observables. Its range dictionary now also covers every
+  one of the lepton-level Δφ observables (`dPhi_lep1_lep2`, `dPhi_lep_nu`,
   `dPhi_W_lep1`, `dPhi_W_lep2`, `dPhi_Z_lep1`, `dPhi_Z_lep2`), not just
   `dPhi_WZ`/`dPhi_Z_lep`/`dPhi_Z_nu`, so the same rigorous flatness test
-  applies to every angular observable the project tracks.
+  applies to every angular observable the project tracks — all of them
+  now computed in this script's own `load()`, per the current design.
 
 ### `ANALYSES`, menus, `main`
 
@@ -1351,26 +1384,29 @@ is the meaningful restore point.
 **Protocol 1 — ROOT tree naming.** Both `SPS_<N>.root` and
 `DPS_<N>.root` contain a single tree named `"Events"`.
 
-**Protocol 2 — ROOT tree branch names.** Both `Events` trees have an
-**identical** branch schema:
+**Protocol 2 — ROOT tree branch names (raw kinematics only).** Both
+`Events` trees have an **identical** branch schema, and — unlike earlier
+versions of this project — that schema now contains **only raw,
+per-particle kinematics and the handful of event-record-only quantities
+that must be computed inside PYTHIA**:
 
 ```
 W_pt, W_eta, W_phi, W_mass, W_rapidity, W_px, W_py, W_pz, W_E, W_charge,
 Z_pt, Z_eta, Z_phi, Z_mass, Z_rapidity, Z_px, Z_py, Z_pz, Z_E,
-dEta_WZ, dPhi_WZ, dY_WZ, M_WZ, pT_WZ, sT,
 lep_pt..lep_E, nu_pt..nu_E,               (W's own lepton + neutrino)
 lep1_pt..lep1_E, lep2_pt..lep2_E,         (Z's two decay leptons, μ-/μ+)
-dPhi_Z_lep, dPhi_Z_nu,
-dPhi_lep1_lep2, dPhi_lep_nu,
-dPhi_W_lep1, dPhi_W_lep2, dPhi_Z_lep1, dPhi_Z_lep2,
-pT_imbalance, weight, nJets30.
+weight, nJets30.
 ```
 
-This is the engineering reason why `GenerateSPS.cc` and `GenerateDPS.cc`
-produce the exact same branch list: any Python script that reads one tree
-can read the other with no file-type-specific logic. `Compare.py`,
-`Convergence.py`, and `Analyze.py` all use
-`uproot.open(path)["Events"].arrays()` identically for both files.
+There are no `dEta_WZ`, `dPhi_WZ`, `dY_WZ`, `M_WZ`, `pT_WZ`, `sT`,
+`pT_imbalance`, or any `dPhi_*` lepton-pair branches in the ROOT file
+anymore — every one of those is now a **derived Python quantity**,
+computed inside each analysis script's own `load()` function from the
+raw branches above (see §4). This is the engineering reason why
+`GenerateSPS.cc` and `GenerateDPS.cc` produce the exact same, purely-raw
+branch list: any Python script that reads one tree can read the other
+with no file-type-specific logic, and all analysis-defining logic lives
+in exactly one layer (Python), not split across C++ and Python.
 
 **Protocol 3 — N encoding.** `Settings.h` defines the default N. The
 Makefile reads it at make-time via regex. Binaries, ROOT files, logs, and
@@ -1378,21 +1414,27 @@ plots are all stamped with N in their filename, so every artifact of a
 given run stays traceable and no two different-N runs ever collide on
 disk.
 
-**Protocol 4 — the Δφ convention.** Every angular separation stored
+**Protocol 4 — the Δφ convention.** Every angular separation used
 anywhere in the project — `dPhi_WZ`, `dPhi_Z_lep`, `dPhi_Z_nu`,
 `dPhi_lep1_lep2`, `dPhi_lep_nu`, `dPhi_W_lep1`, `dPhi_W_lep2`,
-`dPhi_Z_lep1`, `dPhi_Z_lep2` — is computed by the single shared
-`dPhi()` function in `Settings.h`, folded to `[0, π]`. No script ever
+`dPhi_Z_lep1`, `dPhi_Z_lep2` — is folded to `[0, π]` using the same
+convention everywhere: defined once in C++ as `dPhi()` in `Settings.h`
+(now retained there only as the canonical reference definition, since the
+generators no longer call it), and reimplemented as a NumPy-vectorized
+helper (`_dphi_np()`) in each Python analysis script, which is where
+every one of these observables is actually computed today. No script
 recomputes an angular separation with different folding logic, so every
 Δφ observable is directly comparable across every plot and every test in
 the project.
 
 **Adding a new observable — the three-step pattern.** Every observable
-added anywhere in this project follows the same pattern: (1) compute it
-in the C++ generators and store it as a ROOT branch (or derive it from
-existing branches in Python, if it's just a transformation of data
-already stored), (2) add one entry to the `ALL_OBSERVABLES`/
-`OBSERVABLES` catalogue in each Python script that should plot it, (3)
-nothing else — every plotting function, menu, filename builder, and
-statistical test reads from that one catalogue, so no observable-specific
-code needs to be written anywhere else.
+added anywhere in this project follows the same pattern: (1) if it needs
+data not already stored, add the necessary raw per-particle kinematics as
+a ROOT branch in both C++ generators (only genuinely PYTHIA-only
+quantities, like a new event-record scan, belong in C++ — anything
+derivable from existing raw branches should be derived in Python
+instead); (2) add its derivation (if any) plus one entry to the
+`ALL_OBSERVABLES`/`OBSERVABLES` catalogue in each Python script that
+should plot it; (3) nothing else — every plotting function, menu,
+filename builder, and statistical test reads from that one catalogue, so
+no observable-specific code needs to be written anywhere else.
